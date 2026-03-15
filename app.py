@@ -25,22 +25,48 @@ _cap          = None
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+_frame_counter = 0
+_cached_pose   = []
+
 def process_frame(frame_bgr):
-    global _latest_frame, _latest_panel
+    global _latest_frame, _latest_panel, _frame_counter, _cached_pose
 
-    frame_rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    detections = detector.detect(frame_bgr)
-
-    pose_results = []
     h, w = frame_bgr.shape[:2]
-    for det in detections:
-        x1, y1, x2, y2 = det["bbox"]
-        crop = frame_rgb[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
-        pose_results.append(pose_est.estimate(crop) if crop.size else None)
 
-    active     = id_manager.update(detections, pose_results)
-    annotated  = draw_frame(frame_bgr, active, pose_results)
-    annotated  = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+    # Shrink for detection only
+    scale = min(1.0, 640 / max(h, w))
+    small = cv2.resize(frame_bgr, (int(w*scale), int(h*scale))) if scale < 1.0 else frame_bgr
+    detections_small = detector.detect(small)
+
+    # Scale bboxes back
+    detections = []
+    for d in detections_small:
+        x1,y1,x2,y2 = d["bbox"]
+        if scale < 1.0:
+            x1,y1,x2,y2 = int(x1/scale),int(y1/scale),int(x2/scale),int(y2/scale)
+        detections.append({"bbox":[x1,y1,x2,y2],"conf":d["conf"]})
+
+    # Run pose every 2nd frame
+    _frame_counter += 1
+    if _frame_counter % 2 == 0 or not _cached_pose:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pose_results = []
+        for det in detections:
+            x1,y1,x2,y2 = det["bbox"]
+            crop = frame_rgb[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
+            if crop.size:
+                ch,cw = crop.shape[:2]
+                ps = min(1.0, 256/max(ch,cw))
+                if ps < 1.0:
+                    crop = cv2.resize(crop,(int(cw*ps),int(ch*ps)))
+            pose_results.append(pose_est.estimate(crop) if crop.size else None)
+        _cached_pose = pose_results
+    else:
+        pose_results = _cached_pose
+
+    active    = id_manager.update(detections, pose_results)
+    annotated = draw_frame(frame_bgr, active, pose_results)
+    annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
 
     panel_data = qa_engine.generate_panel(id_manager.get_summary())
     panel_html = qa_engine.to_html(panel_data)
@@ -63,7 +89,6 @@ def _cam_loop(source):
         if not ret:
             break
         process_frame(frame)
-        time.sleep(1 / config.MAX_FPS)
     _cap.release()
 
 
@@ -157,8 +182,7 @@ body, .gradio-container { background:#060b14 !important; color:#cdd9e5 !importan
 footer { display:none !important }
 """
 
-with gr.Blocks(css=CSS, title="Identity & Posture System",
-               theme=gr.themes.Base(primary_hue="blue", neutral_hue="slate")) as demo:
+with gr.Blocks(title="Identity & Posture System") as demo:
 
     gr.HTML("""
     <div class="hdr">
@@ -212,4 +236,10 @@ with gr.Blocks(css=CSS, title="Identity & Posture System",
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=True,
+        css=CSS,
+        theme=gr.themes.Base(primary_hue="blue", neutral_hue="slate"),
+    )
